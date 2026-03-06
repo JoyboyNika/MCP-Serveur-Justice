@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  mcp-judilibre:
+    build: .
+    container_name: mcp-judilibre
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - JUDILIBRE_API_KEY=${JUDILIBRE_API_KEY}
+      - JUDILIBRE_ENV=${JUDILIBRE_ENV:-production}
+      - PORT=3001
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

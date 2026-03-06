@@ -1,0 +1,19 @@
+{
+  "name": "mcp-judilibre",
+  "version": "1.0.0",
+  "description": "MCP Server for Judilibre API — Cour de cassation open data",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "author": "Murphy"
+}

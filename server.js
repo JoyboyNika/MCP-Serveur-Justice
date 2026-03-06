@@ -1,0 +1,467 @@
+const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
+const { SSEServerTransport } = require("@modelcontextprotocol/sdk/server/sse.js");
+const { createMcpExpressApp } = require("@modelcontextprotocol/sdk/server/express.js");
+const z = require("zod/v4");
+
+// ─── Configuration ──────────────────────────────────────────
+const PORT = process.env.PORT || 3001;
+const JUDILIBRE_API_KEY = process.env.JUDILIBRE_API_KEY;
+const JUDILIBRE_ENV = process.env.JUDILIBRE_ENV || "production"; // "sandbox" or "production"
+
+const BASE_URLS = {
+  sandbox: "https://sandbox-api.piste.gouv.fr/cassation/judilibre/v1.0",
+  production: "https://api.piste.gouv.fr/cassation/judilibre/v1.0",
+};
+
+const BASE_URL = BASE_URLS[JUDILIBRE_ENV] || BASE_URLS.production;
+
+if (!JUDILIBRE_API_KEY) {
+  console.error("❌ JUDILIBRE_API_KEY is required. Set it in your .env file.");
+  process.exit(1);
+}
+
+// ─── API Helper ─────────────────────────────────────────────
+async function judilibreRequest(endpoint, params = {}) {
+  const url = new URL(`${BASE_URL}${endpoint}`);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      if (Array.isArray(value)) {
+        value.forEach((v) => url.searchParams.append(key, v));
+      } else {
+        url.searchParams.set(key, String(value));
+      }
+    }
+  });
+
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      KeyId: JUDILIBRE_API_KEY,
+    },
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => "");
+    throw new Error(
+      `Judilibre API error ${response.status}: ${response.statusText}. ${errorBody}`
+    );
+  }
+
+  return response.json();
+}
+
+// ─── MCP Server Factory ────────────────────────────────────
+function createServer() {
+  const server = new McpServer(
+    {
+      name: "judilibre-mcp",
+      version: "1.0.0",
+    },
+    { capabilities: { logging: {} } }
+  );
+
+  // ── Tool: Recherche ──────────────────────────────────────
+  server.registerTool("judilibre_search", {
+    title: "Recherche Judilibre",
+    description:
+      "Recherche full-text dans la base Judilibre (Cour de cassation et juridictions judiciaires). Retourne les décisions correspondant aux critères.",
+    inputSchema: {
+      query: z
+        .string()
+        .describe("Texte de recherche libre (ex: 'responsabilité civile', numéro de pourvoi '21-19.675')"),
+      operator: z
+        .enum(["or", "and", "exact"])
+        .default("or")
+        .describe("Opérateur logique: 'or' (défaut), 'and', ou 'exact' (expression exacte)"),
+      field: z
+        .array(z.string())
+        .optional()
+        .describe("Zones ciblées: 'text', 'expose', 'moyens', 'motivations', 'dispositif', 'sommaire', 'titrage', 'numero'"),
+      type: z
+        .array(z.string())
+        .optional()
+        .describe("Type de décision (ex: 'arret', 'avis', 'ordonnance', 'qpc', 'saisine')"),
+      theme: z
+        .array(z.string())
+        .optional()
+        .describe("Thème(s) — utiliser /taxonomy pour lister les valeurs possibles"),
+      chamber: z
+        .array(z.string())
+        .optional()
+        .describe("Chambre(s) (ex: 'soc', 'crim', 'comm', 'civ1', 'civ2', 'civ3', 'pl', 'mi', 'allciv', 'ordo')"),
+      formation: z
+        .array(z.string())
+        .optional()
+        .describe("Formation(s) (ex: 'fp', 'fs', 'fm', 'f')"),
+      jurisdiction: z
+        .array(z.string())
+        .optional()
+        .describe("Juridiction(s) (ex: 'cc' pour Cour de cassation, 'ca' pour cours d'appel)"),
+      publication: z
+        .array(z.string())
+        .optional()
+        .describe("Niveau de publication (ex: 'b', 'r', 'l', 'c', 'n')"),
+      solution: z
+        .array(z.string())
+        .optional()
+        .describe("Type de solution (ex: 'rejet', 'cassation', 'annulation', 'irrecevabilite')"),
+      date_start: z
+        .string()
+        .optional()
+        .describe("Date de début (format YYYY-MM-DD)"),
+      date_end: z
+        .string()
+        .optional()
+        .describe("Date de fin (format YYYY-MM-DD)"),
+      sort: z
+        .enum(["score", "date"])
+        .default("score")
+        .describe("Tri: 'score' (pertinence, défaut) ou 'date'"),
+      order: z
+        .enum(["asc", "desc"])
+        .default("desc")
+        .describe("Ordre: 'desc' (défaut) ou 'asc'"),
+      page: z
+        .number()
+        .int()
+        .min(0)
+        .default(0)
+        .describe("Numéro de page (commence à 0)"),
+      page_size: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .default(10)
+        .describe("Nombre de résultats par page (max 50)"),
+    },
+  }, async (params) => {
+    try {
+      const data = await judilibreRequest("/search", params);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(data, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Erreur: ${error.message}` }],
+        isError: true,
+      };
+    }
+  });
+
+  // ── Tool: Décision ───────────────────────────────────────
+  server.registerTool("judilibre_decision", {
+    title: "Décision Judilibre",
+    description:
+      "Récupère le texte intégral et les métadonnées d'une décision par son identifiant Judilibre.",
+    inputSchema: {
+      id: z.string().describe("Identifiant unique de la décision (ex: '667e51a56430c94f3afa7d0e')"),
+    },
+  }, async ({ id }) => {
+    try {
+      const data = await judilibreRequest("/decision", { id });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(data, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Erreur: ${error.message}` }],
+        isError: true,
+      };
+    }
+  });
+
+  // ── Tool: Taxonomie ──────────────────────────────────────
+  server.registerTool("judilibre_taxonomy", {
+    title: "Taxonomie Judilibre",
+    description:
+      "Récupère les valeurs de taxonomie (listes de chambres, juridictions, formations, types, publications, solutions, thèmes, zones). Utile pour connaître les filtres disponibles.",
+    inputSchema: {
+      id: z
+        .enum([
+          "chamber",
+          "formation",
+          "jurisdiction",
+          "type",
+          "publication",
+          "solution",
+          "theme",
+          "field",
+          "location",
+        ])
+        .describe("Type de taxonomie à récupérer"),
+    },
+  }, async ({ id }) => {
+    try {
+      const data = await judilibreRequest("/taxonomy", { id });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(data, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Erreur: ${error.message}` }],
+        isError: true,
+      };
+    }
+  });
+
+  // ── Tool: Export ─────────────────────────────────────────
+  server.registerTool("judilibre_export", {
+    title: "Export Judilibre",
+    description:
+      "Export par lots de décisions complètes, utile pour récupérer de nombreuses décisions. Attention aux quotas API.",
+    inputSchema: {
+      batch_size: z
+        .number()
+        .int()
+        .min(1)
+        .max(1000)
+        .default(100)
+        .describe("Nombre de décisions par lot (max 1000)"),
+      batch: z
+        .number()
+        .int()
+        .min(0)
+        .default(0)
+        .describe("Index du lot (pagination)"),
+      type: z
+        .string()
+        .optional()
+        .describe("Type de décision"),
+      chamber: z
+        .string()
+        .optional()
+        .describe("Chambre"),
+      jurisdiction: z
+        .string()
+        .optional()
+        .describe("Juridiction"),
+      date_start: z
+        .string()
+        .optional()
+        .describe("Date de début (YYYY-MM-DD)"),
+      date_end: z
+        .string()
+        .optional()
+        .describe("Date de fin (YYYY-MM-DD)"),
+    },
+  }, async (params) => {
+    try {
+      const data = await judilibreRequest("/export", params);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(data, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Erreur: ${error.message}` }],
+        isError: true,
+      };
+    }
+  });
+
+  // ── Tool: Stats ──────────────────────────────────────────
+  server.registerTool("judilibre_stats", {
+    title: "Statistiques Judilibre",
+    description:
+      "Récupère les statistiques d'utilisation et d'état de la base Judilibre (nombre de décisions indexées, requêtes, dates).",
+    inputSchema: {},
+  }, async () => {
+    try {
+      const data = await judilibreRequest("/stats");
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(data, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Erreur: ${error.message}` }],
+        isError: true,
+      };
+    }
+  });
+
+  // ── Tool: Healthcheck ────────────────────────────────────
+  server.registerTool("judilibre_healthcheck", {
+    title: "Healthcheck Judilibre",
+    description: "Vérifie l'état de fonctionnement de l'API Judilibre.",
+    inputSchema: {},
+  }, async () => {
+    try {
+      const data = await judilibreRequest("/healthcheck");
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(data, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Erreur: ${error.message}` }],
+        isError: true,
+      };
+    }
+  });
+
+  // ── Tool: Recherche par numéro de pourvoi ────────────────
+  server.registerTool("judilibre_pourvoi", {
+    title: "Vérification de pourvoi",
+    description:
+      "Recherche rapide d'une décision par son numéro de pourvoi (ex: '21-19.675'). Raccourci pratique.",
+    inputSchema: {
+      numero: z.string().describe("Numéro de pourvoi (ex: '21-19.675')"),
+    },
+  }, async ({ numero }) => {
+    try {
+      const data = await judilibreRequest("/search", {
+        query: numero,
+        field: ["numero"],
+        operator: "exact",
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(data, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Erreur: ${error.message}` }],
+        isError: true,
+      };
+    }
+  });
+
+  return server;
+}
+
+// ─── Express App + SSE Transport ───────────────────────────
+const app = createMcpExpressApp({ host: "0.0.0.0" });
+const transports = {};
+
+// SSE endpoint — Claude.ai connects here
+app.get("/sse", async (req, res) => {
+  console.log(`[${new Date().toISOString()}] New SSE connection`);
+  try {
+    const transport = new SSEServerTransport("/messages", res);
+    const sessionId = transport.sessionId;
+    transports[sessionId] = transport;
+
+    transport.onclose = () => {
+      console.log(`[${new Date().toISOString()}] Session closed: ${sessionId}`);
+      delete transports[sessionId];
+    };
+
+    const server = createServer();
+    await server.connect(transport);
+    console.log(`[${new Date().toISOString()}] Session established: ${sessionId}`);
+  } catch (error) {
+    console.error("Error establishing SSE stream:", error);
+    if (!res.headersSent) {
+      res.status(500).send("Error establishing SSE stream");
+    }
+  }
+});
+
+// Messages endpoint — receives JSON-RPC from Claude
+app.post("/messages", async (req, res) => {
+  const sessionId = req.query.sessionId;
+  if (!sessionId) {
+    return res.status(400).json({ error: "Missing sessionId" });
+  }
+
+  const transport = transports[sessionId];
+  if (!transport) {
+    return res.status(404).json({ error: "Session not found" });
+  }
+
+  try {
+    await transport.handlePostMessage(req, res, req.body);
+  } catch (error) {
+    console.error("Error handling message:", error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Internal error" });
+    }
+  }
+});
+
+// Simple health endpoint
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    sessions: Object.keys(transports).length,
+    env: JUDILIBRE_ENV,
+    uptime: process.uptime(),
+  });
+});
+
+// ─── Start ─────────────────────────────────────────────────
+app.listen(PORT, "0.0.0.0", (error) => {
+  if (error) {
+    console.error("Failed to start:", error);
+    process.exit(1);
+  }
+  console.log(`
+╔══════════════════════════════════════════════════╗
+║          🏛️  MCP Judilibre Server                ║
+╠══════════════════════════════════════════════════╣
+║  Port:        ${String(PORT).padEnd(35)}║
+║  Env:         ${JUDILIBRE_ENV.padEnd(35)}║
+║  SSE:         http://0.0.0.0:${PORT}/sse${" ".repeat(Math.max(0, 22 - String(PORT).length))}║
+║  Health:      http://0.0.0.0:${PORT}/health${" ".repeat(Math.max(0, 19 - String(PORT).length))}║
+╚══════════════════════════════════════════════════╝
+  `);
+});
+
+// Graceful shutdown
+process.on("SIGINT", async () => {
+  console.log("\nShutting down...");
+  for (const sessionId in transports) {
+    try {
+      await transports[sessionId].close();
+      delete transports[sessionId];
+    } catch (e) {
+      /* ignore */
+    }
+  }
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  for (const sessionId in transports) {
+    try {
+      await transports[sessionId].close();
+    } catch (e) {
+      /* ignore */
+    }
+  }
+  process.exit(0);
+});
