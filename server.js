@@ -1,3 +1,21 @@
+const fs = require("fs");
+const path = require("path");
+
+// ─── Load .env file (zero dependencies) ─────────────────────
+const envPath = path.join(__dirname, ".env");
+if (fs.existsSync(envPath)) {
+  fs.readFileSync(envPath, "utf8")
+    .split("\n")
+    .forEach((line) => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) return;
+      const [key, ...rest] = trimmed.split("=");
+      if (key && rest.length) {
+        process.env[key.trim()] = rest.join("=").trim();
+      }
+    });
+}
+
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { SSEServerTransport } = require("@modelcontextprotocol/sdk/server/sse.js");
 const { createMcpExpressApp } = require("@modelcontextprotocol/sdk/server/express.js");
@@ -341,9 +359,8 @@ function createServer() {
     try {
       const data = await judilibreRequest("/search", {
         query: numero,
+        field: ["numero"],
         operator: "exact",
-        page_size: 5,
-        resolve_references: true,
       });
       return {
         content: [
