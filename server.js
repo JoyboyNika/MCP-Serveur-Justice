@@ -341,8 +341,9 @@ function createServer() {
     try {
       const data = await judilibreRequest("/search", {
         query: numero,
-        field: ["numero"],
         operator: "exact",
+        page_size: 5,
+        resolve_references: true,
       });
       return {
         content: [
